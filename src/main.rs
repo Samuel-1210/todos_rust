@@ -1,12 +1,13 @@
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::mysql::MySqlPoolOptions;
 use sqlx::MySqlPool;
+use sqlx::mysql::MySqlPoolOptions;
 use std::env;
 
 #[derive(Clone)]
@@ -14,9 +15,43 @@ struct AppState {
     db: MySqlPool,
 }
 
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+enum ApiError {
+    NotFound(String),
+    Database(sqlx::Error),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::NotFound(message) => (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse { error: message }),
+            )
+                .into_response(),
+            Self::Database(error) => {
+                eprintln!("database error: {error}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "erro interno do servidor".to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+type ApiResult<T> = Result<T, ApiError>;
+
+#[derive(Debug, Serialize, Deserialize)]
 struct Todo {
-    id: Option<i32>,
+    id: i32,
     name: String,
     description: String,
     finished: bool,
@@ -43,43 +78,48 @@ async fn health_check() -> &'static str {
 async fn create_todo(
     State(state): State<AppState>,
     Json(payload): Json<CreateTodo>,
-) -> Result<Json<Todo>, String> {
-    let result = sqlx::query(
+) -> ApiResult<(StatusCode, Json<Todo>)> {
+    let CreateTodo {
+        name,
+        description,
+        finished,
+    } = payload;
+
+    let result = sqlx::query!(
         r#"
         INSERT INTO todos (name, description, finished)
         VALUES (?, ?, ?)
         "#,
+        name,
+        description,
+        finished
     )
-    .bind(&payload.name)
-    .bind(&payload.description)
-    .bind(payload.finished)
     .execute(&state.db)
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(ApiError::Database)?;
 
     let todo = Todo {
-        id: Some(result.last_insert_id() as i32),
-        name: payload.name,
-        description: payload.description,
-        finished: payload.finished,
+        id: result.last_insert_id() as i32,
+        name,
+        description,
+        finished,
     };
 
-    Ok(Json(todo))
+    Ok((StatusCode::CREATED, Json(todo)))
 }
 
-async fn get_todos(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<Todo>>, String> {
-    let todos = sqlx::query_as::<_, Todo>(
+async fn get_todos(State(state): State<AppState>) -> ApiResult<Json<Vec<Todo>>> {
+    let todos = sqlx::query_as!(
+        Todo,
         r#"
-        SELECT id, name, description, finished
+        SELECT id, name, description, finished as `finished: _`
         FROM todos
         ORDER BY id
-        "#,
+        "#
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(ApiError::Database)?;
 
     Ok(Json(todos))
 }
@@ -87,18 +127,20 @@ async fn get_todos(
 async fn get_todo_by_id(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i32>,
-) -> Result<Json<Todo>, String> {
-    let todo = sqlx::query_as::<_, Todo>(
+) -> ApiResult<Json<Todo>> {
+    let todo = sqlx::query_as!(
+        Todo,
         r#"
-        SELECT id, name, description, finished
+        SELECT id, name, description, finished as `finished: _`
         FROM todos
         WHERE id = ?
         "#,
+        id
     )
-    .bind(id)
-    .fetch_one(&state.db)
+    .fetch_optional(&state.db)
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(ApiError::Database)?
+    .ok_or_else(|| ApiError::NotFound(format!("todo {id} nao encontrado")))?;
 
     Ok(Json(todo))
 }
@@ -107,33 +149,45 @@ async fn update_todo(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i32>,
     Json(payload): Json<UpdateTodo>,
-) -> Result<Json<Todo>, String> {
-    sqlx::query(
+) -> ApiResult<Json<Todo>> {
+    let UpdateTodo {
+        name,
+        description,
+        finished,
+    } = payload;
+
+    let result = sqlx::query!(
         r#"
         UPDATE todos
         SET name = ?, description = ?, finished = ?
         WHERE id = ?
         "#,
+        name,
+        description,
+        finished,
+        id
     )
-    .bind(&payload.name)
-    .bind(&payload.description)
-    .bind(payload.finished)
-    .bind(id)
     .execute(&state.db)
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(ApiError::Database)?;
 
-    let todo = sqlx::query_as::<_, Todo>(
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound(format!("todo {id} nao encontrado")));
+    }
+
+    let todo = sqlx::query_as!(
+        Todo,
         r#"
-        SELECT id, name, description, finished
+        SELECT id, name, description, finished as `finished: _`
         FROM todos
         WHERE id = ?
         "#,
+        id
     )
-    .bind(id)
-    .fetch_one(&state.db)
+    .fetch_optional(&state.db)
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(ApiError::Database)?
+    .ok_or_else(|| ApiError::NotFound(format!("todo {id} nao encontrado")))?;
 
     Ok(Json(todo))
 }
@@ -141,17 +195,21 @@ async fn update_todo(
 async fn delete_todo(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i32>,
-) -> Result<StatusCode, String> {
-    sqlx::query(
+) -> ApiResult<StatusCode> {
+    let result = sqlx::query!(
         r#"
         DELETE FROM todos
         WHERE id = ?
         "#,
+        id
     )
-    .bind(id)
     .execute(&state.db)
     .await
-    .map_err(|err| err.to_string())?;
+    .map_err(ApiError::Database)?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound(format!("todo {id} nao encontrado")));
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -176,7 +234,10 @@ async fn main() -> Result<(), sqlx::Error> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/todos", post(create_todo).get(get_todos))
-        .route("/todos/:id", get(get_todo_by_id).put(update_todo).delete(delete_todo))
+        .route(
+            "/todos/:id",
+            get(get_todo_by_id).put(update_todo).delete(delete_todo),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
