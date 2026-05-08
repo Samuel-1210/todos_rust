@@ -19,9 +19,10 @@ struct AppState {
 struct ErrorResponse {
     error: String,
 }
-
+#[derive(Debug)]
 enum ApiError {
     NotFound(String),
+    BadRequest(String),
     Database(sqlx::Error),
 }
 
@@ -33,18 +34,48 @@ impl IntoResponse for ApiError {
                 Json(ErrorResponse { error: message }),
             )
                 .into_response(),
+
+            Self::BadRequest(message) => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: message }),
+            )
+                .into_response(),
+
             Self::Database(error) => {
-                eprintln!("database error: {error}");
+                eprintln!("Erro banco de dados: {error}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
-                        error: "erro interno do servidor".to_string(),
+                        error: "Erro interno do servidor".to_string(),
                     }),
                 )
                     .into_response()
             }
         }
     }
+}
+
+fn validate_todo_fields(name: String, description: String) -> ApiResult<(String, String)> {
+    let name = name.trim().to_owned();
+    let description = description.trim().to_owned();
+
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("Nome não pode ser vazio".to_string()));
+    }
+
+    if description.is_empty() {
+        return Err(ApiError::BadRequest(
+            "Descrição não pode ser vazia".to_string(),
+        ));
+    }
+
+    if name.len() < 3 {
+        return Err(ApiError::BadRequest(
+            "O nome deve ter no mínimo 3 caracteres".to_string(),
+        ));
+    }
+
+    Ok((name, description))
 }
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -84,6 +115,8 @@ async fn create_todo(
         description,
         finished,
     } = payload;
+
+    let (name, description) = validate_todo_fields(name, description)?;
 
     let result = sqlx::query!(
         r#"
@@ -140,7 +173,7 @@ async fn get_todo_by_id(
     .fetch_optional(&state.db)
     .await
     .map_err(ApiError::Database)?
-    .ok_or_else(|| ApiError::NotFound(format!("todo {id} nao encontrado")))?;
+    .ok_or_else(|| ApiError::NotFound(format!("ToDo {id} não encontrado")))?;
 
     Ok(Json(todo))
 }
@@ -155,6 +188,8 @@ async fn update_todo(
         description,
         finished,
     } = payload;
+
+    let (name, description) = validate_todo_fields(name, description)?;
 
     let result = sqlx::query!(
         r#"
@@ -172,7 +207,7 @@ async fn update_todo(
     .map_err(ApiError::Database)?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound(format!("todo {id} nao encontrado")));
+        return Err(ApiError::NotFound(format!("ToDo {id} não encontrado")));
     }
 
     let todo = sqlx::query_as!(
@@ -187,7 +222,7 @@ async fn update_todo(
     .fetch_optional(&state.db)
     .await
     .map_err(ApiError::Database)?
-    .ok_or_else(|| ApiError::NotFound(format!("todo {id} nao encontrado")))?;
+    .ok_or_else(|| ApiError::NotFound(format!("ToDo {id} não encontrado")))?;
 
     Ok(Json(todo))
 }
@@ -208,7 +243,7 @@ async fn delete_todo(
     .map_err(ApiError::Database)?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound(format!("todo {id} nao encontrado")));
+        return Err(ApiError::NotFound(format!("ToDo {id} não encontrado")));
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -249,4 +284,49 @@ async fn main() -> Result<(), sqlx::Error> {
     axum::serve(listener, app).await.unwrap();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_todo_fields_rejects_empty_name() {
+        let result = validate_todo_fields("   ".to_string(), "Descrição válida".to_string());
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message == "Nome não pode ser vazio")
+        );
+    }
+
+    #[test]
+    fn validate_todo_fields_rejects_empty_description() {
+        let result = validate_todo_fields("Tarefa válida".to_string(), "   ".to_string());
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message == "Descrição não pode ser vazia")
+        );
+    }
+
+    #[test]
+    fn validate_todo_fields_rejects_short_name() {
+        let result = validate_todo_fields("Ab".to_string(), "Descrição válida".to_string());
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message == "O nome deve ter no mínimo 3 caracteres")
+        );
+    }
+
+    #[test]
+    fn validate_todo_fields_trims_name_and_description() {
+        let result = validate_todo_fields(
+            "  Tarefa válida  ".to_string(),
+            "  Descrição válida  ".to_string(),
+        );
+
+        let (name, description) = result.expect("validation should succeed");
+
+        assert_eq!(name, "Tarefa válida");
+        assert_eq!(description, "Descrição válida");
+    }
 }
