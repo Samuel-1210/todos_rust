@@ -1,13 +1,13 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::MySqlPool;
 use sqlx::mysql::MySqlPoolOptions;
+use sqlx::{FromRow, MySql, MySqlPool, QueryBuilder};
 use std::env;
 
 #[derive(Clone)]
@@ -80,12 +80,22 @@ fn validate_todo_fields(name: String, description: String) -> ApiResult<(String,
 
 type ApiResult<T> = Result<T, ApiError>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, FromRow)]
 struct Todo {
     id: i32,
     name: String,
     description: String,
     finished: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TodoQueryParams {
+    search: Option<String>,
+    finished: Option<bool>,
+    limit: Option<i64>,
+    page: Option<i64>,
+    sort_by: Option<String>,
+    order_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,18 +151,72 @@ async fn create_todo(
     Ok((StatusCode::CREATED, Json(todo)))
 }
 
-async fn get_todos(State(state): State<AppState>) -> ApiResult<Json<Vec<Todo>>> {
-    let todos = sqlx::query_as!(
-        Todo,
-        r#"
-        SELECT id, name, description, finished as `finished: _`
-        FROM todos
-        ORDER BY id
-        "#
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(ApiError::Database)?;
+async fn get_todos(
+    State(state): State<AppState>,
+    Query(params): Query<TodoQueryParams>,
+) -> ApiResult<Json<Vec<Todo>>> {
+    let mut query_builder =
+        QueryBuilder::<MySql>::new("SELECT id, name, description, finished FROM todos");
+    let mut has_where = false;
+
+    if let Some(finished) = params.finished {
+        query_builder.push(" WHERE finished = ").push_bind(finished);
+        has_where = true;
+    }
+
+    if let Some(search) = params.search {
+        let search = search.trim();
+
+        if !search.is_empty() {
+            let pattern = format!("%{search}%");
+
+            if has_where {
+                query_builder.push(" AND ");
+            } else {
+                query_builder.push(" WHERE ");
+            }
+
+            query_builder
+                .push("(name LIKE ")
+                .push_bind(pattern.clone())
+                .push(" OR description LIKE ")
+                .push_bind(pattern)
+                .push(")");
+        }
+    }
+
+    let sort_column = match params.sort_by.as_deref() {
+        Some("name") => "name",
+        Some("description") => "description",
+        Some("finished") => "finished",
+        _ => "id",
+    };
+
+    let sort_order = match params.order_by.as_deref() {
+        Some(o) if o.eq_ignore_ascii_case("desc") => "DESC",
+        _ => "ASC",
+    };
+
+    query_builder.push(" ORDER BY ");
+    query_builder.push(sort_column);
+    query_builder.push(" ");
+    query_builder.push(sort_order);
+
+    let limit = params.limit.unwrap_or(20);
+    let page = params.page.unwrap_or(1);
+    if page < 1 {
+        return Err(ApiError::BadRequest("page deve ser maior ou igual a 1".to_string()));
+    }
+    let offset = (page - 1) * limit;
+
+    query_builder.push(" LIMIT ").push_bind(limit);
+    query_builder.push(" OFFSET ").push_bind(offset);
+
+    let todos = query_builder
+        .build_query_as::<Todo>()
+        .fetch_all(&state.db)
+        .await
+        .map_err(ApiError::Database)?;
 
     Ok(Json(todos))
 }
