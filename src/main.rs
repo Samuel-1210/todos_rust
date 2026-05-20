@@ -12,6 +12,12 @@ use std::env;
 async fn main() -> Result<(), sqlx::Error> {
     dotenvy::dotenv().ok();
 
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL nao foi definida");
 
     let pool = MySqlPoolOptions::new()
@@ -21,7 +27,7 @@ async fn main() -> Result<(), sqlx::Error> {
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
-    println!("Banco conectado e migrations aplicadas");
+    tracing::info!("Banco conectado e migrations aplicadas");
 
     let state = AppState { db: pool };
     let app = build_app(state);
@@ -30,7 +36,7 @@ async fn main() -> Result<(), sqlx::Error> {
         .await
         .unwrap();
 
-    println!("Servidor rodando em http://127.0.0.1:3000");
+    tracing::info!("Servidor rodando em http://127.0.0.1:3000");
 
     axum::serve(listener, app).await.unwrap();
 

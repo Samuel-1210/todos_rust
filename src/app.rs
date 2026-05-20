@@ -2,6 +2,7 @@ use axum::{
     Router,
     routing::{get, post},
 };
+use tower_http::trace::TraceLayer;
 
 use crate::{
     state::AppState,
@@ -23,5 +24,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
                 .patch(patch_todo)
                 .delete(delete_todo),
         )
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
