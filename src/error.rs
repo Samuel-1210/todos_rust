@@ -35,7 +35,7 @@ impl IntoResponse for ApiError {
                 .into_response(),
 
             Self::Database(error) => {
-                eprintln!("Erro banco de dados: {error}");
+                tracing::error!("Erro banco de dados: {error:?}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {

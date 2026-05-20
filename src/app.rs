@@ -1,11 +1,14 @@
 use axum::{
     Router,
-    routing::{get, post},
+    routing::{get, patch, post},
 };
+use tower_http::trace::TraceLayer;
 
 use crate::{
     state::AppState,
-    todos::{create_todo, delete_todo, get_todo_by_id, get_todos, patch_todo, update_todo},
+    todos::{
+        create_todo, delete_todo, get_todo_by_id, get_todos, patch_todo, restore_todo, update_todo,
+    },
 };
 
 async fn health_check() -> &'static str {
@@ -16,6 +19,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/todos", post(create_todo).get(get_todos))
+        .route("/todos/:id/restore", patch(restore_todo))
         .route(
             "/todos/:id",
             get(get_todo_by_id)
@@ -23,5 +27,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
                 .patch(patch_todo)
                 .delete(delete_todo),
         )
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

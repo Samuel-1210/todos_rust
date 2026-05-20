@@ -95,6 +95,7 @@ pub(crate) struct Todo {
     finished: bool,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -264,9 +265,9 @@ fn validate_todo_timestamps(todo: Todo) -> ApiResult<Todo> {
 async fn fetch_todo_by_id(pool: &MySqlPool, id: i32) -> ApiResult<Todo> {
     let todo = sqlx::query_as::<_, Todo>(
         r#"
-        SELECT id, name, description, finished, created_at, updated_at
+        SELECT id, name, description, finished, created_at, updated_at, deleted_at
         FROM todos
-        WHERE id = ?
+        WHERE id = ? AND deleted_at IS NULL
         "#,
     )
     .bind(id)
@@ -279,25 +280,18 @@ async fn fetch_todo_by_id(pool: &MySqlPool, id: i32) -> ApiResult<Todo> {
 }
 
 fn apply_todo_filters(query_builder: &mut QueryBuilder<'_, MySql>, params: &ValidatedTodoQuery) {
-    let mut has_where = false;
+    query_builder.push(" WHERE deleted_at IS NULL");
 
     if let Some(finished) = params.finished {
-        query_builder.push(" WHERE finished = ").push_bind(finished);
-        has_where = true;
+        query_builder.push(" AND finished = ").push_bind(finished);
     }
 
     if let Some(search) = params.search.as_deref().map(str::trim) {
         if !search.is_empty() {
             let pattern = format!("%{search}%");
 
-            if has_where {
-                query_builder.push(" AND ");
-            } else {
-                query_builder.push(" WHERE ");
-            }
-
             query_builder
-                .push("(name LIKE ")
+                .push(" AND (name LIKE ")
                 .push_bind(pattern.clone())
                 .push(" OR description LIKE ")
                 .push_bind(pattern)
@@ -352,7 +346,7 @@ pub(crate) async fn get_todos(
         .map_err(ApiError::Database)?;
 
     let mut items_builder = QueryBuilder::<MySql>::new(
-        "SELECT id, name, description, finished, created_at, updated_at FROM todos",
+        "SELECT id, name, description, finished, created_at, updated_at, deleted_at FROM todos",
     );
     apply_todo_filters(&mut items_builder, &params);
     items_builder
@@ -413,7 +407,7 @@ pub(crate) async fn update_todo(
         r#"
         UPDATE todos
         SET name = ?, description = ?, finished = ?
-        WHERE id = ?
+        WHERE id = ? AND deleted_at IS NULL
         "#,
     )
     .bind(&name)
@@ -449,7 +443,7 @@ pub(crate) async fn patch_todo(
         r#"
         UPDATE todos
         SET name = ?, description = ?, finished = ?
-        WHERE id = ?
+        WHERE id = ? AND deleted_at IS NULL
         "#,
     )
     .bind(&name)
@@ -471,8 +465,9 @@ pub(crate) async fn delete_todo(
 ) -> ApiResult<StatusCode> {
     let result = sqlx::query(
         r#"
-        DELETE FROM todos
-        WHERE id = ?
+        UPDATE todos
+        SET deleted_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND deleted_at IS NULL
         "#,
     )
     .bind(id)
@@ -485,6 +480,31 @@ pub(crate) async fn delete_todo(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn restore_todo(
+    State(state): State<AppState>,
+    Path(id): Path<i32>,
+) -> ApiResult<Json<Todo>> {
+    let result = sqlx::query(
+        r#"
+        UPDATE todos
+        SET deleted_at = NULL
+        WHERE id = ? AND deleted_at IS NOT NULL
+        "#,
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await
+    .map_err(ApiError::Database)?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound(format!("Todo {id} nao encontrado")));
+    }
+
+    let todo = fetch_todo_by_id(&state.db, id).await?;
+
+    Ok(Json(todo))
 }
 
 #[cfg(test)]
