@@ -5,6 +5,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sqlx::{FromRow, MySql, MySqlPool, QueryBuilder};
 
 use crate::{
@@ -106,6 +107,24 @@ pub(crate) struct TodoListResponse {
     total: i64,
     prev: Option<i64>,
     next: Option<i64>,
+}
+
+#[derive(Debug, FromRow)]
+struct TodoEventRow {
+    id: i64,
+    todo_id: i32,
+    event_type: String,
+    payload: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct TodoHistoryItem {
+    id: i64,
+    todo_id: i32,
+    event_type: String,
+    payload: Value,
+    created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -279,6 +298,20 @@ async fn fetch_todo_by_id(pool: &MySqlPool, id: i32) -> ApiResult<Todo> {
     validate_todo_timestamps(todo)
 }
 
+async fn ensure_todo_exists(pool: &MySqlPool, id: i32) -> ApiResult<()> {
+    let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM todos WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .map_err(ApiError::Database)?;
+
+    if total == 0 {
+        return Err(ApiError::NotFound(format!("Todo {id} nao encontrado")));
+    }
+
+    Ok(())
+}
+
 fn apply_todo_filters(query_builder: &mut QueryBuilder<'_, MySql>, params: &ValidatedTodoQuery) {
     query_builder.push(" WHERE deleted_at IS NULL");
 
@@ -352,6 +385,69 @@ pub(crate) enum TodoEvent {
     },
 }
 
+impl TodoEvent {
+    fn event_type(&self) -> &'static str {
+        match self {
+            Self::TodoCreated { .. } => "todo_created",
+            Self::TodoUpdated { .. } => "todo_updated",
+            Self::TodoPatched { .. } => "todo_patched",
+            Self::TodoDeleted { .. } => "todo_deleted",
+            Self::TodoRestored { .. } => "todo_restored",
+        }
+    }
+
+    fn payload(&self) -> Value {
+        match self {
+            Self::TodoCreated {
+                name,
+                description,
+                finished,
+            } => json!({
+                "name": name,
+                "description": description,
+                "finished": finished,
+            }),
+            Self::TodoUpdated {
+                id,
+                name,
+                description,
+                finished,
+            }
+            | Self::TodoPatched {
+                id,
+                name,
+                description,
+                finished,
+            } => json!({
+                "id": id,
+                "name": name,
+                "description": description,
+                "finished": finished,
+            }),
+            Self::TodoDeleted { id } | Self::TodoRestored { id } => json!({
+                "id": id,
+            }),
+        }
+    }
+}
+
+async fn record_todo_event(pool: &MySqlPool, todo_id: i32, event: &TodoEvent) -> ApiResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO todo_events (todo_id, event_type, payload)
+        VALUES (?, ?, ?)
+        "#,
+    )
+    .bind(todo_id)
+    .bind(event.event_type())
+    .bind(event.payload().to_string())
+    .execute(pool)
+    .await
+    .map_err(ApiError::Database)?;
+
+    Ok(())
+}
+
 pub(crate) struct TodoAggregate;
 
 impl TodoAggregate {
@@ -381,7 +477,7 @@ impl TodoAggregate {
 
         let (name, description) = validate_todo_fields(name, description)?;
 
-        Ok(TodoEvent::TodoUpdated {
+        Ok(TodoEvent::TodoPatched {
             id: command.id,
             name,
             description,
@@ -414,7 +510,7 @@ pub(crate) async fn create_todo(
 
     let event = TodoAggregate::handle_create(command)?;
 
-    match event {
+    match &event {
         TodoEvent::TodoCreated {
             name,
             description,
@@ -428,12 +524,13 @@ pub(crate) async fn create_todo(
             )
             .bind(&name)
             .bind(&description)
-            .bind(finished)
+            .bind(*finished)
             .execute(&state.db)
             .await
             .map_err(ApiError::Database)?;
 
             let todo = fetch_todo_by_id(&state.db, result.last_insert_id() as i32).await?;
+            record_todo_event(&state.db, todo.id, &event).await?;
 
             Ok((StatusCode::CREATED, Json(todo)))
         }
@@ -492,6 +589,37 @@ pub(crate) async fn get_todos(
     }))
 }
 
+pub(crate) async fn get_todo_history(
+    State(state): State<AppState>,
+    Path(id): Path<i32>,
+) -> ApiResult<Json<Vec<TodoHistoryItem>>> {
+    ensure_todo_exists(&state.db, id).await?;
+
+    let events = sqlx::query_as::<_, TodoEventRow>(
+        r#"
+        SELECT id, todo_id, event_type, payload, created_at
+        FROM todo_events
+        WHERE todo_id = ?
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(ApiError::Database)?
+    .into_iter()
+    .map(|event| TodoHistoryItem {
+        id: event.id,
+        todo_id: event.todo_id,
+        event_type: event.event_type,
+        payload: serde_json::from_str(&event.payload).unwrap_or(Value::String(event.payload)),
+        created_at: event.created_at,
+    })
+    .collect();
+
+    Ok(Json(events))
+}
+
 pub(crate) async fn get_todo_by_id(
     State(state): State<AppState>,
     Path(id): Path<i32>,
@@ -515,7 +643,7 @@ pub(crate) async fn update_todo(
 
     let event = TodoAggregate::handle_update(command)?;
 
-    match event {
+    match &event {
         TodoEvent::TodoUpdated {
             id,
             name,
@@ -531,8 +659,8 @@ pub(crate) async fn update_todo(
             )
             .bind(&name)
             .bind(&description)
-            .bind(finished)
-            .bind(id)
+            .bind(*finished)
+            .bind(*id)
             .execute(&state.db)
             .await
             .map_err(ApiError::Database)?;
@@ -541,7 +669,9 @@ pub(crate) async fn update_todo(
                 return Err(ApiError::NotFound(format!("Todo {id} nao encontrado")));
             }
 
-            let todo = fetch_todo_by_id(&state.db, id).await?;
+            record_todo_event(&state.db, *id, &event).await?;
+
+            let todo = fetch_todo_by_id(&state.db, *id).await?;
 
             Ok(Json(todo))
         }
@@ -567,8 +697,8 @@ pub(crate) async fn patch_todo(
 
     let event = TodoAggregate::handle_patch(command, current_todo)?;
 
-    match event {
-        TodoEvent::TodoUpdated {
+    match &event {
+        TodoEvent::TodoPatched {
             id,
             name,
             description,
@@ -583,15 +713,17 @@ pub(crate) async fn patch_todo(
             )
             .bind(&name)
             .bind(&description)
-            .bind(finished)
-            .bind(id)
+            .bind(*finished)
+            .bind(*id)
             .execute(&state.db)
             .await
             .map_err(ApiError::Database)?;
             if result.rows_affected() == 0 {
                 return Err(ApiError::NotFound(format!("Todo {id} nao encontrado")));
             }
-            let todo = fetch_todo_by_id(&state.db, id).await?;
+            record_todo_event(&state.db, *id, &event).await?;
+
+            let todo = fetch_todo_by_id(&state.db, *id).await?;
             Ok(Json(todo))
         }
         _ => unreachable!(),
@@ -604,7 +736,7 @@ pub(crate) async fn delete_todo(
 ) -> ApiResult<StatusCode> {
     let command = DeleteTodoCommand { id };
     let event = TodoAggregate::handle_delete(command)?;
-    match event {
+    match &event {
         TodoEvent::TodoDeleted { id } => {
             let result = sqlx::query(
                 r#"
@@ -613,13 +745,15 @@ pub(crate) async fn delete_todo(
                 WHERE id = ? AND deleted_at IS NULL
                 "#,
             )
-            .bind(id)
+            .bind(*id)
             .execute(&state.db)
             .await
             .map_err(ApiError::Database)?;
             if result.rows_affected() == 0 {
                 return Err(ApiError::NotFound(format!("Todo {id} nao encontrado")));
             }
+            record_todo_event(&state.db, *id, &event).await?;
+
             Ok(StatusCode::NO_CONTENT)
         }
         _ => unreachable!(),
@@ -631,7 +765,7 @@ pub(crate) async fn restore_todo(
 ) -> ApiResult<Json<Todo>> {
     let command = RestoreTodoCommand { id };
     let event = TodoAggregate::handle_restore(command)?;
-    match event {
+    match &event {
         TodoEvent::TodoRestored { id } => {
             let result = sqlx::query(
                 r#"
@@ -640,7 +774,7 @@ pub(crate) async fn restore_todo(
         WHERE id = ? AND deleted_at IS NOT NULL
         "#,
             )
-            .bind(id)
+            .bind(*id)
             .execute(&state.db)
             .await
             .map_err(ApiError::Database)?;
@@ -649,7 +783,9 @@ pub(crate) async fn restore_todo(
                 return Err(ApiError::NotFound(format!("Todo {id} nao encontrado")));
             }
 
-            let todo = fetch_todo_by_id(&state.db, id).await?;
+            record_todo_event(&state.db, *id, &event).await?;
+
+            let todo = fetch_todo_by_id(&state.db, *id).await?;
 
             Ok(Json(todo))
         }

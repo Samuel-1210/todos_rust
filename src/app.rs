@@ -7,7 +7,8 @@ use tower_http::trace::TraceLayer;
 use crate::{
     state::AppState,
     todos::{
-        create_todo, delete_todo, get_todo_by_id, get_todos, patch_todo, restore_todo, update_todo,
+        create_todo, delete_todo, get_todo_by_id, get_todo_history, get_todos, patch_todo,
+        restore_todo, update_todo,
     },
 };
 
@@ -19,6 +20,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/todos", post(create_todo).get(get_todos))
+        .route("/todos/:id/events", get(get_todo_history))
         .route("/todos/:id/restore", patch(restore_todo))
         .route(
             "/todos/:id",
